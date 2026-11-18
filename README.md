@@ -1,21 +1,30 @@
 # Agentic Hill Climbing
 
-A proof of concept for using the OpenCode SDK to improve a seven-day NYC subway ridership forecast. OpenCode proposes a Python model, a trusted evaluator backtests it, and the loop keeps it only if it improves on the current best. A forecast blend that refits without an agent is the comparison baseline.
+An AI agent proposes Python models for seven-day NYC subway ridership forecasts. A separate evaluator tests each proposal and keeps it only if it beats both the current model and a baseline that refits without an agent.
 
-By default the loop replays a [pinned snapshot](orchestrator/data/mta-subway-2026-11-15.json) of [MTA daily ridership estimates](https://data.ny.gov/d/sayj-mze2). It gives OpenCode up to three attempts on four search weeks, then tests only the winner on three separate promotion weeks. To replace the current model, the winner must beat both the current model and the refitted blend on promotion mean absolute error (MAE). The replay target is scored separately after model selection; its actuals are not used for training or promotion.
+## Demo result
 
-## Layout
+In a one-off Cloud Run replay for **November 9–15, 2026**, GPT‑6.2 Sol proposed three candidates. The evaluator promoted one, and the job published all seven predictions to Cloud Storage.
 
-| Path | Purpose |
+| Model | Mean absolute error (riders/day) |
 | --- | --- |
-| [`orchestrator/`](orchestrator/) | Bun and TypeScript project for the OpenCode SDK, evaluator, and Cloud Storage access |
-| [`sandbox/`](sandbox/) | Python 3.12 environment and Docker image for candidate execution |
-| [`candidates/`](candidates/) | Python candidate interface and refitted-blend baseline |
-| [`infra/`](infra/) | GCP setup and scheduling instructions |
+| Refitted baseline | 201,987 |
+| Promoted model | **92,377 (54% lower)** |
 
-## Local setup
+This is one held-out replay week, not a result for the full scheduled campaign.
 
-Prerequisites: Bun and Docker. uv and Python 3.12 are optional for inspecting dependencies.
+![Cloud Storage listing the published one-off replay artifact, 2026-11-09.json](assets/cloud-storage-replay-artifact.png)
+
+## How the scheduled replay works
+
+1. **Pick the next week.** Cloud Scheduler triggers `forecast-weekly` on Wednesdays at 2 p.m. New York time. The job picks the earliest unpublished week in an eight-week campaign using a [pinned MTA snapshot](orchestrator/data/mta-subway-2026-11-15.json). It does not call the [live MTA feed](https://data.ny.gov/d/sayj-mze2).
+2. **Propose and test.** The OpenCode SDK proposes up to three Python models. Candidates run in isolated Python sandboxes without network access. Four search weeks determine which proposal advances.
+3. **Promote and publish.** The best proposal from search must beat both the incumbent and the refitted baseline on three separate promotion weeks. The evaluator then scores the selected model on the target week, whose actuals were not used for training or promotion.
+4. **Carry the winner forward.** Cloud Storage holds one write-once result per week. Each run starts from the previous campaign winner, or the baseline for week one. After eight weeks, subsequent runs exit without calling the model.
+
+## Run locally
+
+You’ll need Bun and Docker. Start with the baseline replay, which requires no API key:
 
 ```sh
 bun install --cwd orchestrator --frozen-lockfile
@@ -25,16 +34,39 @@ bun test
 bun run forecast --baseline-only
 ```
 
-The baseline-only command uses the bundled MTA history without contacting MTA or a model provider. To try the agent loop from `orchestrator/`, configure credentials for your chosen OpenCode provider and run:
+To run the agent loop, configure credentials for your OpenCode provider (for example, `OPENAI_API_KEY`) and run from `orchestrator/`:
 
 ```sh
-FORECAST_MODEL=provider/model bun run forecast
+FORECAST_MODEL=openai/gpt-6.2-sol bun run forecast
 ```
 
-The embedded SDK uses an in-memory credential store, so supply a provider environment variable such as `OPENAI_API_KEY`. To use an account already connected to your **running local OpenCode service** instead, set `FORECAST_USE_LOCAL_SERVICE=1` along with `FORECAST_MODEL`. This option doesn't apply on Cloud Run.
+To use an account already connected to a **running local OpenCode service** instead, also set `FORECAST_USE_LOCAL_SERVICE=1`. This option is local only.
 
-The default replay targets November 9–15, 2026, the last complete week in the snapshot. You can pass an earlier start date, such as `2026-11-02`. Run replay dates in chronological order so each week starts from the previous winner. Snapshot artifacts are written once under `artifacts/snapshots/<snapshot-id>/baseline/` or `artifacts/snapshots/<snapshot-id>/forecasts/`, with a replay score for the target week. Running the same window again in the same store skips existing results.
+| Command | What it runs |
+| --- | --- |
+| `bun run forecast` | Replay November 9–15, 2026, the last complete week in the snapshot. Pass an earlier start date, such as `2026-11-02`, to replay a different week. |
+| `bun run forecast --replay-next` | Advance the eight-week campaign by one window, starting with September 21–27, 2026. |
+| `bun run forecast --live` | Forecast seven days starting today in New York. If recent MTA data is incomplete, the job stops without publishing. |
 
-For a rolling demo, use `bun run forecast --replay-next`. Each invocation processes the earliest unpublished week in an eight-week campaign starting September 21, 2026, and starts from the previous campaign winner if one exists. Campaign artifacts are separate from one-off replays under `artifacts/snapshots/<snapshot-id>/campaign/`. When the campaign is complete, new invocations do not call the model or publish anything.
+Local results go under `artifacts/`. One-off replays use `snapshots/<snapshot-id>/`, scheduled-style replays use `snapshots/<snapshot-id>/campaign/`, and live results stay separate. Add `--baseline-only` for a baseline run in any mode. When running one-off dates, use chronological order so each replay can use the previous winner.
 
-Use `bun run forecast --live` to forecast the next seven dates starting today in New York. Live results are separate (`artifacts/forecasts/`, or `artifacts/baseline/` with `--baseline-only`). Training ends two calendar days before the target start in both modes. Live mode stops without publishing if the feed is incomplete, and scores a previously published forecast once its actuals are available. Candidate code only runs in the sandbox. See [the GCP deployment instructions](infra/README.md).
+## Deployment
+
+GitHub Actions verifies pull requests and deploys the tested image to Cloud Run on pushes to `main`. Deployments don’t trigger a forecast or change the schedule. See the [GCP setup and scheduling guide](infra/README.md).
+
+<details>
+<summary>Google Cloud deployment screenshots</summary>
+
+**Cloud Run:** the deployed `forecast-weekly` job in `us-central1`.
+
+![Cloud Run overview showing the forecast-weekly job in us-central1](assets/cloud-run-forecast-job.png)
+
+**Cloud Scheduler:** the weekly trigger was enabled but hadn’t fired when this screenshot was taken.
+
+![Cloud Scheduler showing the enabled Wednesday 2 p.m. New York trigger for forecast-weekly](assets/cloud-scheduler-weekly-trigger.png)
+
+</details>
+
+- [`orchestrator/`](orchestrator/): Bun and TypeScript orchestration, scoring, and artifact storage
+- [`sandbox/`](sandbox/): Python runtime and candidate executor
+- [`candidates/`](candidates/): Candidate interface and refitted baseline
