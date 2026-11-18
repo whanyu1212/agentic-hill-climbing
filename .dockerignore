@@ -1,0 +1,14 @@
+**
+!sandbox/
+!sandbox/Dockerfile
+!sandbox/pyproject.toml
+!sandbox/uv.lock
+!sandbox/run_candidate.py
+!orchestrator/
+!orchestrator/package.json
+!orchestrator/bun.lock
+!orchestrator/src/
+!orchestrator/src/*.ts
+orchestrator/src/*.test.ts
+!candidates/
+!candidates/baseline.py

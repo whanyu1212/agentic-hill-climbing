@@ -1,0 +1,11 @@
+[project]
+name = "hill-climbing-python-runtime"
+version = "0.1.0"
+requires-python = "==3.12.*"
+dependencies = [
+    "numpy>=2.2,<3",
+    "pandas>=2.2,<4",
+    "scipy>=1.15,<2",
+    "scikit-learn>=1.6,<2",
+    "statsmodels>=0.14.4,<1",
+]
