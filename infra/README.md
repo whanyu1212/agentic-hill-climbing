@@ -25,20 +25,27 @@ gcloud beta run jobs create forecast-weekly \
 gcloud run jobs execute forecast-weekly --project "$PROJECT" --region "$REGION" --wait
 ```
 
-Verify that a real Cloud Run execution can launch the Python sandbox and publish one valid replay artifact. The image can be built locally, but the native launcher is only available inside Cloud Run. Leave the snapshot job unscheduled: a repeat of the same window is a no-op once published.
+Verify that a real Cloud Run execution can launch the Python sandbox and publish one valid replay artifact. The image can be built locally, but the native launcher is only available inside Cloud Run.
 
-## Optional: Schedule live forecasts
+## Schedule the snapshot replay campaign
 
-To use [Cloud Scheduler](https://docs.cloud.google.com/run/docs/execute/jobs-on-schedule), first enable the Cloud Scheduler API and set the job's container arguments to `--live` (after `bun run src/cli.ts`). Live forecasts are written to `forecasts/`, separately from the replay artifacts. Give a separate Scheduler service account (`SCHEDULER_SA`) `roles/run.invoker` on the job. Test a live execution before creating the schedule.
+After deploying an image that supports `--replay-next`, set that argument on the job. The campaign runs one historical week per execution, starting September 21, 2026. Each run takes the earliest unpublished week and uses the previous campaign winner as its incumbent. It writes to `snapshots/<snapshot-id>/campaign/forecasts/`, leaving one-off results untouched. Runs exit without calling the model after all eight weeks are published. Pause the schedule when the campaign is complete.
+
+Enable the [Cloud Scheduler API](https://docs.cloud.google.com/run/docs/execute/jobs-on-schedule) and give a dedicated Scheduler service account (`SCHEDULER_SA`) `roles/run.invoker` on this job. This schedule triggers the job on Wednesdays at 2 p.m. New York time:
 
 ```sh
+gcloud beta run jobs update forecast-weekly \
+  --project "$PROJECT" --region "$REGION" --args=--replay-next --sandbox-launcher
+
 gcloud scheduler jobs create http forecast-weekly \
   --project "$PROJECT" --location "$REGION" \
   --schedule "0 14 * * 3" --time-zone "America/New_York" \
   --uri "https://run.googleapis.com/v2/projects/$PROJECT/locations/$REGION/jobs/forecast-weekly:run" \
   --http-method POST --headers "Content-Type=application/json" --message-body '{}' \
-  --oauth-service-account-email "$SCHEDULER_SA"
+  --oauth-service-account-email "$SCHEDULER_SA" --max-retry-attempts=0
 ```
+
+For live forecasts instead, set the job's container argument to `--live` and test an execution before enabling the schedule. Live forecasts are written to `forecasts/`.
 
 ## Continuous deployment from GitHub
 

@@ -5,7 +5,7 @@ import { cloudArtifacts, localArtifacts } from "./artifacts";
 import { cloudRunExecutor, dockerExecutor } from "./executor";
 import { withOpenCode, type Propose } from "./propose";
 import { fetchRidership, nyToday, validDate } from "./ridership";
-import { replaySnapshot } from "./snapshot";
+import { nextReplayStart, replaySnapshot } from "./snapshot";
 import { runWeek, scorePublished } from "./weekly";
 
 async function main(args: string[]): Promise<void> {
@@ -14,16 +14,23 @@ async function main(args: string[]): Promise<void> {
     options: {
       "baseline-only": { type: "boolean" },
       live: { type: "boolean" },
+      "replay-next": { type: "boolean" },
     },
     allowPositionals: true,
   });
   const baselineOnly = values["baseline-only"];
+  const campaign = values["replay-next"];
   const replay = values.live ? undefined : replaySnapshot;
   const latestStart = replay?.defaultStart ?? nyToday();
-  const asOf = positionals[0] ?? latestStart;
-  if (positionals.length > 1 || !validDate(asOf) || asOf > latestStart) {
+  const requestedStart = positionals[0] ?? latestStart;
+  if (
+    positionals.length > 1 ||
+    !validDate(requestedStart) ||
+    requestedStart > latestStart ||
+    (campaign && (values.live || positionals.length > 0))
+  ) {
     throw new Error(
-      `Usage: bun run forecast [--baseline-only] [--live] [YYYY-MM-DD]; latest start is ${latestStart}.`,
+      `Usage: bun run forecast [--baseline-only] [--replay-next | [--live] [YYYY-MM-DD]]; latest start is ${latestStart}.`,
     );
   }
   const model = process.env.FORECAST_MODEL;
@@ -40,15 +47,22 @@ async function main(args: string[]): Promise<void> {
     );
   }
   const kind = baselineOnly ? "baseline" : "forecasts";
-  const folder = replay ? `snapshots/${replay.id}/${kind}` : kind;
+  const folder = replay
+    ? `snapshots/${replay.id}/${campaign ? "campaign/" : ""}${kind}`
+    : kind;
   const store =
     bucket && !baselineOnly
       ? cloudArtifacts(bucket, `${folder}/`)
       : await localArtifacts(
           fileURLToPath(new URL(`../../artifacts/${folder}/`, import.meta.url)),
         );
-  const key = `${asOf}.json`;
   const keys = await store.list();
+  const asOf = campaign ? nextReplayStart(keys) : requestedStart;
+  if (!asOf) {
+    console.log("Snapshot replay campaign is complete; no forecast to run.");
+    return;
+  }
+  const key = `${asOf}.json`;
   if (keys.includes(key)) {
     console.log(`Forecast ${asOf} is already published.`);
     return;
