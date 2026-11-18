@@ -1,17 +1,18 @@
 # GCP deployment
 
-[Cloud Scheduler triggers a Cloud Run Job](https://docs.cloud.google.com/run/docs/execute/jobs-on-schedule). The job runs the OpenCode SDK and evaluator; Cloud Storage keeps the immutable forecast artifacts. The latest earlier artifact supplies the incumbent. A Cloud Storage generation precondition prevents duplicate publication.
+The Cloud Run Job runs the OpenCode SDK and evaluator; Cloud Storage keeps the immutable forecast artifacts. By default the job replays the pinned MTA snapshot without contacting the live MTA feed, and writes under `snapshots/<snapshot-id>/forecasts/`. The latest earlier artifact in that prefix supplies the incumbent. A Cloud Storage generation precondition prevents duplicate publication.
 
 The job starts a fresh [Cloud Run sandbox (Preview)](https://docs.cloud.google.com/run/docs/configuring/jobs/sandboxes) for each fold. It uses a dedicated Python root filesystem at `/opt/python-rootfs`, not the parent filesystem. It passes input through stdin, keeps egress off, and validates bounded prediction output in the parent. The candidate doesn't receive the job's identity, credentials, or held-out actuals.
 
-## Deploy from the repository root
+## Bootstrap from the repository root
 
-Use a recent Google Cloud CLI with the beta commands installed. Enable the Cloud Run, Cloud Scheduler, Secret Manager, and Artifact Registry APIs. Create a private storage bucket and a Docker repository. Give the job service account `roles/storage.objectViewer` and `roles/storage.objectCreator` on the forecast bucket, plus `roles/secretmanager.secretAccessor` on only the model credential secret. Give a separate Scheduler service account `roles/run.invoker` on this job.
+Use a Google Cloud CLI version that supports `gcloud beta run jobs create --sandbox-launcher` (verified with 594.0.0) with the beta component installed. Enable the Cloud Run, Secret Manager, and Artifact Registry APIs. Create a private storage bucket and a Docker repository. Give the job service account `roles/storage.objectViewer` and `roles/storage.objectCreator` on the forecast bucket, plus `roles/secretmanager.secretAccessor` on only the model credential secret.
 
-Set `PROJECT`, `REGION`, `IMAGE` (a tagged Artifact Registry image URL), `JOB_SA`, `SCHEDULER_SA`, `BUCKET`, and `MODEL` (`provider/model`). The example uses an OpenAI key stored as `forecast-openai-api-key`; change the secret and environment variable to match your provider.
+Set `PROJECT`, `REGION`, `IMAGE` (a tagged Artifact Registry image URL), `JOB_SA`, `BUCKET`, and `MODEL` (`provider/model`). The example uses an OpenAI key stored as `forecast-openai-api-key`; change the secret and environment variable to match your provider.
 
 ```sh
-docker build --platform linux/amd64 -f sandbox/Dockerfile --target cloud -t "$IMAGE" .
+gcloud auth configure-docker "$REGION-docker.pkg.dev"
+bash infra/build-cloud-image.sh "$IMAGE"
 docker push "$IMAGE"
 
 gcloud beta run jobs create forecast-weekly \
@@ -24,7 +25,11 @@ gcloud beta run jobs create forecast-weekly \
 gcloud run jobs execute forecast-weekly --project "$PROJECT" --region "$REGION" --wait
 ```
 
-Before scheduling, verify that a real Cloud Run execution can launch the Python sandbox and publish one valid artifact. The image can be built locally, but the native launcher is only available inside Cloud Run.
+Verify that a real Cloud Run execution can launch the Python sandbox and publish one valid replay artifact. The image can be built locally, but the native launcher is only available inside Cloud Run. Leave the snapshot job unscheduled: a repeat of the same window is a no-op once published.
+
+## Optional: Schedule live forecasts
+
+To use [Cloud Scheduler](https://docs.cloud.google.com/run/docs/execute/jobs-on-schedule), first enable the Cloud Scheduler API and set the job's container arguments to `--live` (after `bun run src/cli.ts`). Live forecasts are written to `forecasts/`, separately from the replay artifacts. Give a separate Scheduler service account (`SCHEDULER_SA`) `roles/run.invoker` on the job. Test a live execution before creating the schedule.
 
 ```sh
 gcloud scheduler jobs create http forecast-weekly \
@@ -33,4 +38,39 @@ gcloud scheduler jobs create http forecast-weekly \
   --uri "https://run.googleapis.com/v2/projects/$PROJECT/locations/$REGION/jobs/forecast-weekly:run" \
   --http-method POST --headers "Content-Type=application/json" --message-body '{}' \
   --oauth-service-account-email "$SCHEDULER_SA"
+```
+
+## Continuous deployment from GitHub
+
+[GitHub Actions](../.github/workflows/ci-cd.yml) checks formatting and types, runs the Bun tests, and builds and smoke-tests the Linux AMD64 Cloud Run image on pull requests. A push to `main` that passes verification builds and smoke-tests the image before publishing it to Artifact Registry. The workflow updates `forecast-weekly` to the pushed image digest with the sandbox launcher enabled. It does not execute the job or change its runtime identity, secrets, bucket, or schedule.
+
+After bootstrapping GCP, [set up Workload Identity Federation for GitHub Actions](https://docs.cloud.google.com/iam/docs/workload-identity-federation-with-deployment-pipelines#github-actions) with a separate deploy service account. Enable the IAM, Resource Manager, Security Token Service, and Service Account Credentials APIs for federation. No service account key or model API key is needed in GitHub.
+
+1. Create a dedicated workload identity pool and GitHub OIDC provider (issuer `https://token.actions.githubusercontent.com`). Map `google.subject=assertion.sub` and `attribute.repository_id=assertion.repository_id`. Set this provider condition with the repository's numeric ID (for example, from `gh api repos/OWNER/REPO --jq .id`):
+
+   ```cel
+   assertion.repository_id == 'REPO_ID' &&
+   assertion.ref == 'refs/heads/main' &&
+   assertion.event_name == 'push' &&
+   assertion.environment == 'production'
+   ```
+
+2. Grant `roles/iam.workloadIdentityUser` on the deploy service account to `principalSet://iam.googleapis.com/projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/POOL_ID/attribute.repository_id/REPO_ID`. Use the pool project's **number**, not its ID.
+3. Grant the deploy identity `roles/artifactregistry.writer` on the Docker repository, `roles/run.developer` on `forecast-weekly`, and `roles/iam.serviceAccountUser` on the job's runtime service account. Keep the runtime and Scheduler permissions separate.
+4. Create a GitHub Actions environment named `production`, restrict deployment branches to `main`, and set these environment variables before merging the workflow:
+
+   | Variable | Value |
+   | --- | --- |
+   | `GCP_PROJECT_ID` | Project ID containing the job and registry |
+   | `GCP_REGION` | Region containing the job and Docker repository |
+   | `GCP_ARTIFACT_REPOSITORY` | Artifact Registry Docker repository name |
+   | `GCP_WORKLOAD_IDENTITY_PROVIDER` | `projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/POOL_ID/providers/PROVIDER_ID` |
+   | `GCP_DEPLOY_SERVICE_ACCOUNT` | Deploy service account email |
+
+Keep previous deployed digests available in Artifact Registry. To roll back without launching a forecast, take the previous digest reference from the successful deploy's GitHub Actions summary and run:
+
+```sh
+gcloud beta run jobs update forecast-weekly \
+  --project "$PROJECT" --region "$REGION" --image "$PREVIOUS_DIGEST_REF" \
+  --sandbox-launcher
 ```

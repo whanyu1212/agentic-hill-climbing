@@ -7,6 +7,7 @@ import { backtestFolds, forecastInput, predict } from "./evaluate";
 import type { ExecuteCandidate } from "./executor";
 import { candidateSource } from "./propose";
 import { addDays, datesFrom, observations } from "./ridership";
+import { replaySnapshot } from "./snapshot";
 import { runWeek, scorePublished } from "./weekly";
 
 const asOf = "2026-09-07";
@@ -28,6 +29,35 @@ test("hides observations after cutoff", () => {
 test("rejects a recent gap", () => {
   const missing = history.filter(({ date }) => date !== "2026-09-05");
   expect(() => forecastInput(missing, asOf)).toThrow("incomplete");
+});
+
+test("holds replay actuals out", () => {
+  const { history, defaultStart } = replaySnapshot;
+  const { history: training, forecast_dates: dates } = forecastInput(
+    history,
+    defaultStart,
+  );
+  const { search, promotion } = backtestFolds(history, defaultStart);
+  const actuals = history.slice(-dates.length);
+  const forecast = actuals.map(({ riders }) => riders);
+
+  expect(training.at(-1)?.date).toBe(addDays(defaultStart, -2));
+  expect(search[3].input.forecast_dates.at(-1)).toBe(
+    addDays(promotion[0].input.forecast_dates[0], -1),
+  );
+  expect(promotion[2].input.forecast_dates.at(-1)).toBe(
+    addDays(defaultStart, -8),
+  );
+  expect(actuals.map(({ date }) => date)).toEqual(dates);
+  expect(
+    scorePublished(history, {
+      asOf: defaultStart,
+      dates,
+      source: "test",
+      forecast,
+      baselineForecast: forecast.map((riders) => riders + 1),
+    }),
+  ).toEqual({ asOf: defaultStart, mae: 0, baselineMae: 1 });
 });
 
 test.each([
