@@ -105,9 +105,11 @@ export async function localArtifacts(
   };
 }
 
-export function cloudArtifacts(bucketName: string): ArtifactStore {
+export function cloudArtifacts(
+  bucketName: string,
+  prefix: string,
+): ArtifactStore {
   const bucket = new Storage().bucket(bucketName);
-  const prefix = "forecasts/";
   return {
     async list() {
       const [files] = await bucket.getFiles({ prefix });

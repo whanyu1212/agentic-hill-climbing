@@ -26,6 +26,7 @@ WORKDIR /app/orchestrator
 COPY orchestrator/package.json orchestrator/bun.lock ./
 RUN bun install --production --frozen-lockfile
 COPY orchestrator/src ./src
+COPY orchestrator/data ./data
 COPY candidates/baseline.py /app/candidates/baseline.py
 COPY --from=sandbox / /opt/python-rootfs/
 

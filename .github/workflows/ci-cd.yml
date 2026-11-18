@@ -1,0 +1,90 @@
+name: CI/CD
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.11
+      - name: Check orchestrator
+        working-directory: orchestrator
+        run: |
+          bun install --frozen-lockfile
+          bun run format:check
+          bun run check
+          bun test
+      - name: Build and smoke-test the Cloud Run image
+        if: github.event_name == 'pull_request'
+        run: bash infra/build-cloud-image.sh forecast-weekly:ci
+
+  deploy:
+    name: Deploy forecast-weekly
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      PROJECT: ${{ vars.GCP_PROJECT_ID }}
+      REGION: ${{ vars.GCP_REGION }}
+      REPOSITORY: ${{ vars.GCP_ARTIFACT_REPOSITORY }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Build and smoke-test the Cloud Run image
+        run: bash infra/build-cloud-image.sh forecast-weekly:ci
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          project_id: ${{ env.PROJECT }}
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+        with:
+          install_components: beta
+      - name: Publish image and update Cloud Run Job
+        shell: bash
+        run: |
+          : "${PROJECT:?Set GCP_PROJECT_ID}" "${REGION:?Set GCP_REGION}" \
+            "${REPOSITORY:?Set GCP_ARTIFACT_REPOSITORY}"
+          registry="${REGION}-docker.pkg.dev"
+          tag="${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          image="${registry}/${PROJECT}/${REPOSITORY}/forecast-weekly:${tag}"
+
+          gcloud auth configure-docker "$registry" --quiet
+          docker tag forecast-weekly:ci "$image"
+          docker push "$image"
+          digest="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$image")"
+          if [[ ! "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+            printf 'Artifact Registry did not return a digest for %s.\n' "$image" >&2
+            exit 1
+          fi
+          digest_ref="${image%:*}@${digest}"
+
+          gcloud beta run jobs update forecast-weekly \
+            --project "$PROJECT" --region "$REGION" --image "$digest_ref" \
+            --sandbox-launcher --quiet
+          printf 'Deployed `forecast-weekly` with `%s`.\n' "$digest_ref" >> "$GITHUB_STEP_SUMMARY"

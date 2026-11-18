@@ -99,14 +99,14 @@ export function dockerExecutor(
   );
 }
 
-export function cloudRunExecutor(): ExecuteCandidate {
-  const launcher = "/usr/local/gcp/bin/sandbox";
+export function cloudRunExecutor(
+  launcher = "/usr/local/gcp/bin/sandbox",
+): ExecuteCandidate {
+  // The preview launcher can use a custom rootfs with `run` but not `do`.
   return isolatedExecutor(
     (name) => [
       launcher,
-      "do",
-      "--sandbox-name",
-      name,
+      "run",
       "--rootfs",
       "/opt/python-rootfs",
       "--workdir",
@@ -119,20 +119,24 @@ export function cloudRunExecutor(): ExecuteCandidate {
       "OMP_NUM_THREADS=1",
       "--env",
       "MKL_NUM_THREADS=1",
+      name,
       "--",
       "/opt/sandbox/.venv/bin/python",
       "/opt/sandbox/run_candidate.py",
     ],
     (name) => [launcher, "delete", "--force", name],
+    { removeAfterSuccess: true },
   );
 }
 
 function isolatedExecutor(
   run: (name: string) => string[],
   remove: (name: string) => string[],
+  { removeAfterSuccess = false } = {},
 ): ExecuteCandidate {
   return async (source, input) => {
     const name = `hill-climb-${randomUUID()}`;
+    const cleanup = () => runProcess(remove(name), "", 5_000);
     let output: string;
     try {
       output = await runProcess(
@@ -142,8 +146,17 @@ function isolatedExecutor(
       );
     } catch (error) {
       // A killed launcher can leave its sandbox running; it may also already be gone.
-      await runProcess(remove(name), "", 5_000).catch(() => {});
+      await cleanup().catch(() => {});
       throw error;
+    }
+    if (removeAfterSuccess) {
+      try {
+        await cleanup();
+      } catch (cause) {
+        throw new Error(`Failed to remove Cloud Run sandbox ${name}.`, {
+          cause,
+        });
+      }
     }
     try {
       return JSON.parse(output);
